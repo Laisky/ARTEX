@@ -33,22 +33,67 @@ ensure_docker(){
 # ── ① 全部 Docker ───────────────────────────────
 install_docker(){
   ensure_docker
+  local pw key bind_ip
   if [ ! -f .env ]; then
     cp .env.example .env 2>/dev/null || true
-    local pw key
     pw="$(ask 'Postgres 密码（回车随机生成）' "$(rand)")"
+    bind_ip="$(ask 'Tailscale IPv4（tailscale ip -4）' "$(tailscale ip -4 2>/dev/null | head -n 1 || true)")"
     key="$(ask 'ANTHROPIC_API_KEY（可留空，后续在 UI 配）' '')"
+    [ -n "$bind_ip" ] || die "未提供 Tailscale IPv4；请先运行 tailscale up"
+    [ "$bind_ip" != "0.0.0.0" ] || die "ARTEX_BIND_IP 不能是 0.0.0.0"
+    sed -i.bak "s|^ARTEX_BIND_IP=.*|ARTEX_BIND_IP=${bind_ip}|" .env
     sed -i.bak "s|^POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${pw}|" .env
     sed -i.bak "s|^ANTHROPIC_API_KEY=.*|ANTHROPIC_API_KEY=${key}|" .env
     rm -f .env.bak
-    ok "已生成 .env（POSTGRES_PASSWORD 已设置）"
+    chmod 600 .env
+    ok "已生成 .env（Tailscale 地址与 POSTGRES_PASSWORD 已设置）"
   else
     info "沿用已存在的 .env"
+    pw="$(sed -n 's/^POSTGRES_PASSWORD=//p' .env | tail -n 1)"
+    bind_ip="$(sed -n 's/^ARTEX_BIND_IP=//p' .env | tail -n 1)"
+    if [ -z "$bind_ip" ]; then
+      bind_ip="$(ask 'Tailscale IPv4（tailscale ip -4）' "$(tailscale ip -4 2>/dev/null | head -n 1 || true)")"
+      [ -n "$bind_ip" ] || die "未提供 Tailscale IPv4；请先运行 tailscale up"
+      [ "$bind_ip" != "0.0.0.0" ] || die "ARTEX_BIND_IP 不能是 0.0.0.0"
+      printf '\nARTEX_BIND_IP=%s\n' "$bind_ip" >> .env
+      ok "已补充 .env 的 ARTEX_BIND_IP"
+    fi
   fi
-  info "拉取镜像并启动…"
-  docker compose pull || true
+
+  [ -n "$pw" ] || die "未找到 POSTGRES_PASSWORD；请检查 .env"
+  [ -n "$bind_ip" ] || die "未找到 ARTEX_BIND_IP；请检查 .env"
+
+  if [ ! -f config.json ]; then
+    cat > config.json <<JSON
+{
+  "database": {
+    "host": "postgres",
+    "port": 5432,
+    "user": "artex",
+    "password": "${pw}",
+    "dbname": "artex_local",
+    "sslmode": "disable"
+  },
+  "skill_dir": "/app/skills"
+}
+JSON
+    chmod 600 config.json
+    ok "已生成容器模式 config.json"
+  else
+    info "沿用已存在的 config.json；请确认 database.host 为 postgres"
+  fi
+
+  if [ ! -s jwt.key ]; then
+    openssl rand -hex 32 > jwt.key
+    chmod 600 jwt.key
+    ok "已生成持久化 jwt.key"
+  fi
+
+  docker volume create artex-local-pgdata >/dev/null
+  info "从当前源码构建并启动…"
+  docker compose build artex
   docker compose up -d
-  ok "启动完成 → http://localhost:8787"
+  ok "启动完成 → http://${bind_ip}:8787"
   info "查看日志：docker compose logs -f artex"
 }
 

@@ -1,10 +1,15 @@
 .git
+.env
+.env.*
+config.json
+jwt.key
 **/node_modules
 web/.next
 web/out
 server/webui/dist
 /artex
 data
+backups
 *.db
 transcripts
 bench/kv

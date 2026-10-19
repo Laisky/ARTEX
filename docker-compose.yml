@@ -4,29 +4,32 @@ services:
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-artex}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 设置 POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB:-artex}
+      POSTGRES_DB: ${POSTGRES_DB:-artex_local}
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks:
+      - artex
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-artex} -d ${POSTGRES_DB:-artex}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-artex} -d ${POSTGRES_DB:-artex_local}"]
       interval: 5s
       timeout: 3s
       retries: 10
     restart: unless-stopped
 
   artex:
-    # 镜像源由本仓库自维护（原 autumn27/artex 已从 Docker Hub 删除）。
-    # 正常部署直接拉取本镜像；拉取失败（或想改代码）时本地构建：
-    #   docker compose build
-    image: mianhuatang11/artex:${ARTEX_TAG:-latest}
+    # 默认从当前源码构建，避免本地实验环境无意中运行未固定的远端镜像。
+    image: artex-local:${ARTEX_TAG:-local}
     build:
       context: .
       dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - artex
     environment:
-      ARTEX_PG_DSN: postgres://${POSTGRES_USER:-artex}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-artex}?sslmode=disable
+      ARTEX_CONFIG: /app/config.json
+      ARTEX_SKILL_DIR: /app/skills
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ARTEX_LLM_PROVIDER: ${ARTEX_LLM_PROVIDER:-}
@@ -34,16 +37,29 @@ services:
       ARTEX_LLM_BASE_URL: ${ARTEX_LLM_BASE_URL:-}
       ARTEX_LLM_PROXY: ${ARTEX_LLM_PROXY:-}
     ports:
-      - "8787:8787"
-      - "127.0.0.1:8788:8788"
+      # 仅绑定 Tailscale IPv4，避免监听 0.0.0.0。端口转发代理同样只在 tailnet 可达。
+      - "${ARTEX_BIND_IP:?请在 .env 设置 Tailscale IPv4}:8787:8787"
+      - "${ARTEX_BIND_IP:?请在 .env 设置 Tailscale IPv4}:8788:8788"
     volumes:
-      # 把数据目录（含 jwt.key、SQLite 等）绑定到项目根目录的 data/，
-      # 方便在宿主机直接查看/备份，容器重建也不丢。
+      # 配置文件、JWT 签名密钥、工作区、会话与流量数据均持久化到宿主机。
+      - ./config.json:/app/config.json
+      - ./jwt.key:/app/jwt.key
       - ./data:/app/data
-      # 把项目根目录的 skills 挂进容器（覆盖镜像内置的 /app/skills）；
-      # 改 skill 无需重建镜像，容器读的就是宿主机这份。
       - ./skills:/app/skills
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8787/api/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
     restart: unless-stopped
+
+networks:
+  # Private network for standalone deployments.
+  artex:
 
 volumes:
   pgdata:
+    # 独立于 Compose 生命周期；docker compose down -v 也不会删除外部卷。
+    external: true
+    name: artex-local-pgdata

@@ -1,260 +1,132 @@
-# ARTEX Local Setup Manual
+# ARTEX：dev 主机部署与维护
 
-## Purpose and verification status
+本机 ARTEX 的唯一管理入口是 `/home/laisky/repo/laisky/VPS/dev-docker-compose.yml`。
+所有服务直接定义在该文件中，不使用 include、import 或 extends，也不依赖 ARTEX
+仓库的 Compose 或 `.env`。ARTEX checkout 仅提供构建源码、Dockerfile 和 skills。
 
-This manual covers building ARTEX from source, starting a fresh local idle instance, checking its UI/API, stopping it, and retaining its data.
+## 1. 当前拓扑
 
-Repository: **Laisky/ARTEX**  
-Pinned revision: [5c0dbd4bec940f3c0faf20705a56d879b57d3dfe](https://github.com/Laisky/ARTEX/commit/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe)
+| 项目 | 当前配置 |
+|---|---|
+| Compose project | `vps` |
+| ARTEX 服务 / 容器 | `artex` / `vps-artex-1` |
+| ARTEX 专属数据库服务 / 容器 | `postgres` / `vps-postgres-1` |
+| 应用镜像 | 本地源码构建 `artex-local:local` |
+| 数据库镜像 | `postgres:16-alpine` |
+| 外部数据库卷 | `artex-local-pgdata` |
+| ARTEX 专属网络 | `vps_artex` |
+| HTTP 地址 | `http://100.75.198.70:8787` |
+| 流量代理地址 | `http://100.75.198.70:8788` |
+| 模型上游 | `https://oneapi.laisky.com/v1` |
 
-**Source-reviewed only, not run-tested.** No installation, build, startup, or health-check result is claimed here. The commands below target Bash on Linux/macOS; native Windows instructions are not verified.
+VPS Compose 中的 `postgre` 是另一套数据库；它的存储、环境文件和端口保持原配置。
+ARTEX 的 PostgreSQL 不发布宿主机端口，应用端口只绑定本机 Tailscale IPv4。
 
-Scope: local isolated study and idle-instance checks only. Do not create targets, scans, or testing tasks; configure model credentials, remote MCPs, or asset synchronization; or import production data. Read the repository's [LICENSE](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/LICENSE) and [README usage restrictions](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/README.md) first.
+## 2. 配置、凭据与数据位置
 
-## 1. Prerequisites and chosen deployment route
+| 宿主机位置 | 用途 / 容器位置 |
+|---|---|
+| `/opt/configs/env/dev/artex.env` | 仅模型环境变量及 API Key，通过服务 env_file 注入 |
+| `/opt/configs/env/dev/artex-postgres.env` | 仅 PostgreSQL 初始化变量及密码，注入数据库容器 |
+| `/opt/configs/artex/dev/config.json` | 数据库连接与 skills 路径，挂载 `/app/config.json`，只读 |
+| `/opt/configs/artex/dev/jwt.key` | JWT 签名密钥，挂载 `/app/jwt.key`，只读 |
+| `/opt/configs/artex/dev/admin-password` | 管理员密码，仅供宿主机操作员使用，不挂载 |
+| `/opt/configs/artex/dev/pg-password` | 原部署保存的数据库密码副本，不挂载 |
+| `/opt/configs/artex/dev/data/` | 会话、流量、工作文件及 CA 等，挂载 `/app/data` |
+| `/opt/configs/artex/dev/backups/` | 数据库、敏感文件备份和迁移回执，不挂载 |
+| Docker 卷 `artex-local-pgdata` | PostgreSQL 数据，挂载 `/var/lib/postgresql/data` |
+| ARTEX checkout 的 `skills/` | 技能源码，挂载 `/app/skills` |
 
-Use a local PostgreSQL installation plus a source-built binary with the frontend embedded:
+私有配置目录为 `0700`，凭据文件为 `0600`；运行期 data 的目录和文件由应用管理，
+其父目录保持 `0700`。这些 ARTEX 私有路径已写入 `/opt/configs/.git/info/exclude`，
+不会作为 configs 仓库的新文件自动出现在 Git 中。不要将环境文件、密码或备份加入 Git。
 
-- Git
-- Go 1.26.3 or a version satisfying the module's requirements; use `go.mod` as the authority
-- Node.js 22 and its accompanying npm, matching the release workflow's major version
-- PostgreSQL 16 as a reference version; the repository Compose file uses `postgres:16-alpine`
-- rsync for copying generated frontend contents accurately
-- A regular local OS user and a separate writable working directory; the application does not require root for these ports
+环境文件使用 Compose 的 `format: raw`，按 `KEY=原始值` 保存，不给值额外加引号；
+其中的 `$` 不参与 Compose 插值。不要把完整 `docker compose config` 或容器 inspect
+输出粘贴到日志、工单或聊天中，因为展开后包含密钥。
 
-Install prerequisites from their official distribution channels using the normal process for your OS. This guide does not install a package manager, Docker daemon, or privileged system service.
+应用 env 文件包含 `OPENAI_API_KEY`、`ARTEX_LLM_PROVIDER`、`ARTEX_LLM_MODEL`、
+`ARTEX_LLM_BASE_URL` 等，provider 当前为 `openai`，API Base 为
+`https://oneapi.laisky.com/v1`。已保存到数据库中的模型配置优先于环境变量；如 UI
+已配置模型，需要同步修改 UI。不要在应用环境中注入 PostgreSQL 初始化密码。
 
-Dependency installation/building can contact package registries and execute npm lifecycle scripts. This is **not an offline build**. The pinned source requires `github.com/Autumn-27/norma v0.4.3`; its current download availability has not been tested. If a dependency is unavailable, record the exact package/version and redacted error. Do not substitute untrusted archives/scripts or disable dependency verification.
+`config.json` 的数据库 host 保持 `postgres`；数据库密码须与数据库当前角色密码一致。
+修改 env 文件的 `POSTGRES_PASSWORD` 不会自动轮换已有数据库卷中的角色密码。
 
-Sources: [go.mod](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/go.mod), [release workflow](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/.github/workflows/release.yml), [Compose](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/docker-compose.yml)
+## 3. 日常管理
 
-## 2. Obtain and pin a fresh checkout
-
-Choose a new directory name that does not already contain an installation:
-
-```bash
-git clone https://github.com/Laisky/ARTEX.git ARTEX-local-study
-cd ARTEX-local-study
-git checkout --detach 5c0dbd4bec940f3c0faf20705a56d879b57d3dfe
-git rev-parse HEAD
-git status --short
-
-go version
-node --version
-npm --version
-psql --version
-```
-
-Record the actual versions. Pinning the source does not pin every system package, toolchain, or remotely downloaded artifact.
-
-## 3. Prepare a genuinely new database
-
-Under an existing local PostgreSQL administrator identity, create a dedicated non-superuser role and empty database:
-
-```bash
-createuser --pwprompt artex_study
-createdb --owner=artex_study artex_study
-```
-
-The administrator login method depends on how PostgreSQL was installed. These are PostgreSQL administration commands, not commands to run blindly under the application account. If either name already exists, choose new names and update every subsequent example; do not reuse or overwrite an existing instance.
-
-Enter the new database password interactively on your own machine. Do not place it in public documentation, command arguments, or Git. The application role needs access to its dedicated database and permission to create/manage the application's objects there; do not grant it superuser privileges.
-
-Verify the actual local database port. The remaining examples use `127.0.0.1:5432`:
+以下命令从 VPS 目录执行：
 
 ```bash
-pg_isready -h 127.0.0.1 -p 5432
-psql -h 127.0.0.1 -p 5432 -U artex_study -d artex_study -W \
-  -c 'select current_database(), current_user;'
+cd /home/laisky/repo/laisky/VPS
+docker compose -p vps -f dev-docker-compose.yml ps
+docker compose -p vps -f dev-docker-compose.yml logs --tail=100 artex
 ```
 
-Do not restore an old ARTEX database. Startup applies schema changes and seeds built-in configuration, so it is not a read-only database connection. Precreating the database avoids depending on the application role's CREATEDB permission.
-
-Source: [database initialization](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/db/db.go)
-
-## 4. Create the local configuration
-
-Create `config.json` in the checkout root and replace the password placeholder locally:
-
-```json
-{
-  "database": {
-    "host": "127.0.0.1",
-    "port": 5432,
-    "user": "artex_study",
-    "password": "<fill in locally>",
-    "dbname": "artex_study",
-    "sslmode": "disable"
-  },
-  "skill_dir": "./skills"
-}
-```
-
-The `sslmode` example is restricted to this local loopback database connection, not a remote database. Do not blindly copy the sample file's port `5433` or skill path `/opt/artex/skills`; match your actual setup.
-
-Configuration precedence:
-
-1. `ARTEX_PG_DSN` overrides database configuration in the file
-2. A nonempty `database.dsn` overrides separate database fields
-3. `ARTEX_CONFIG` explicitly selects the configuration file
-4. `ARTEX_SKILL_DIR` overrides `skill_dir`
-
-Keep `config.json`, `jwt.key`, credentials, database backups, and sensitive log contents out of Git and public comments.
-
-Sources: [configuration example](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/config.example.json), [configuration resolution](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/config/config.go), [.gitignore](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/.gitignore)
-
-## 5. Build the embedded-UI binary
-
-Build the real local UI with mock mode unset:
+修改 `/opt/configs/env/dev/artex.env` 后重新创建应用容器：
 
 ```bash
-unset NEXT_PUBLIC_MOCK NEXT_PUBLIC_SSE_BASE
-
-(
-  cd web
-  npm ci
-  npm run build:static
-)
-
-mkdir -p server/webui/dist
-rsync -a web/out/ server/webui/dist/
-
-CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
+docker compose -p vps -f dev-docker-compose.yml up -d --no-deps --force-recreate artex
 ```
 
-Use a fresh checkout and generated-output directory. If stale generated files already exist, start from a new checkout rather than deleting potentially useful files.
-
-Copy the **contents** of `web/out/`, including `_next`, into `server/webui/dist/`; avoid an accidental `dist/out` nesting. Omitting `-tags embedui` produces a backend without the embedded UI.
-
-This direct build leaves the default development version identifier. It does not claim to be an official release.
-
-Sources: [build.sh](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/build.sh), [frontend scripts](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/web/package.json), [embedded frontend handler](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/server/webui_embed.go)
-
-## 6. First local idle startup
-
-Prerequisites: the database is the new empty database created above; the checkout has no old `data`, `jwt.key`, or staged update artifacts. Do not import old tasks, model profiles, credentials, or remote-service configurations.
+修改应用源码后构建并更新应用：
 
 ```bash
-unset ANTHROPIC_API_KEY OPENAI_API_KEY
-unset ARTEX_PG_DSN ARTEX_SKILL_DIR
-unset ARTEX_LLM_PROVIDER ARTEX_LLM_MODEL ARTEX_LLM_BASE_URL ARTEX_LLM_PROXY
-export ARTEX_CONFIG="$PWD/config.json"
-
-./start.sh -addr 127.0.0.1:8787 -proxy 127.0.0.1:8788 -data "$PWD/data"
+docker compose -p vps -f dev-docker-compose.yml build artex
+docker compose -p vps -f dev-docker-compose.yml up -d --no-deps artex
 ```
 
-Both application HTTP and the traffic-recording proxy are explicitly bound to loopback. Do not configure a browser/system proxy, import its CA, forward these ports, or expose them to a LAN or the Internet.
-
-The reviewed source indicates:
-
-- Without a model configuration, the engine remains idle
-- A new database seeds the browser MCP and ScopeSentry as **disabled**
-- Enabled MCPs with empty tool caches are discovered automatically at startup; that can launch a subprocess or contact a configured remote service
-- Persisted model configuration takes precedence over environment variables
-- Existing nonterminal task runtimes can be restored on startup
-
-**Unsetting environment variables does not make an old database a safe blank instance.** Use a genuinely new database and data directory.
-
-Loopback binding limits incoming connections; it does not prove the application has no outbound capability. This guide does not claim to provide complete network isolation and does not ask you to change host firewall or security settings. It preserves the application's existing approval/safety controls.
-
-Sources: [main/startup flags](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/cmd/artex/main.go), [model configuration and task restoration](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/server/server.go#L237-L294), [disabled browser MCP seed](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/db/db.go#L255-L269), [MCP discovery](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/server/mcpdiscover.go), [environment model configuration](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/agent/provider.go#L145-L192)
-
-## 7. Health checks without creating tasks
-
-In another terminal, access only the local instance:
+停止或恢复 ARTEX：
 
 ```bash
-curl --fail --silent --show-error http://127.0.0.1:8787/api/health
-curl --fail --silent --show-error http://127.0.0.1:8787/api/auth/status
+docker compose -p vps -f dev-docker-compose.yml stop artex postgres
+docker compose -p vps -f dev-docker-compose.yml up -d postgres artex
 ```
 
-Expected observations, **not verified results**:
+所有服务统一维护时直接使用此 dev Compose；只维护 ARTEX 时显式指定服务，避免重启其它服务。
+不要再运行 ARTEX checkout 的独立 Compose 或安装/更新脚本来管理这台 dev 主机，
+不要让另一个 PostgreSQL 进程同时使用同一数据库卷。
 
-- Health returns JSON with `ok: true`, `service: "artex"`, and `version`
-- Before initial password setup in a new database, auth status returns `initialized: false`
-- Health is an HTTP liveness response, not a comprehensive dependency-readiness test; auth status performs a database read
-- Open `http://127.0.0.1:8787/setup` in your browser and personally set a new administrator password
-- The login username is `ARTEX`; source password validation requires at least 8 characters and at most 72 bytes
-- Inspect the blank UI only; do not create tasks, targets, assets, model configurations, or enable MCPs
+## 4. 登录与验收
 
-Before marking startup successful, record actual tool versions, the configuration path and idle message in startup logs, actual listening addresses, whether the UI loaded, and the check timestamp. Do not paste passwords, tokens, private infrastructure details, or raw sensitive logs.
-
-Sources: [health handler](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/server/server.go#L947-L949), [authentication/setup](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/server/auth.go)
-
-## 8. Frontend-only mock preview
-
-For UI study without a Go backend, database, or model credentials, the repository supports mock mode:
+管理员用户名为 `ARTEX`。密码存放在上面的私有文件中；不要输出到终端或提交到 Git。
+保持 JWT 密钥不变可保留现有登录会话。首次设置密码的接口只用于全新数据库，
+当前已初始化的实例不要重新初始化。
 
 ```bash
-cd web
-npm ci
-NEXT_PUBLIC_MOCK=1 npm run dev -- --hostname 127.0.0.1 --port 5173
+curl --noproxy '*' --fail --silent --show-error http://100.75.198.70:8787/api/health
+curl --noproxy '*' --fail --silent --show-error http://100.75.198.70:8787/api/auth/status
 ```
 
-Open `http://127.0.0.1:5173`. This is simulated UI data, not evidence of successful backend deployment. Mock mode removes the development API reverse proxy; it is not a guarantee that every browser network request is isolated.
+两个容器应为 healthy，管理员状态为 initialized:true。迁移验收还要检查旧 JWT、
+管理员密码、数据库计数、镜像 ID 和凭据内容是否保持一致。
 
-The port is explicit because `dev.sh` describes 5173 but invokes `npm run dev` without setting a port, and the package script is simply `next dev`.
+## 5. 备份与恢复
 
-Stop with Ctrl-C. Before building the real UI afterward, unset mock-related environment variables and rebuild.
+从 VPS 目录执行，备份文件保持私有权限：
 
-Sources: [mock flag](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/web/src/lib/mock/enabled.ts), [Next configuration](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/web/next.config.mjs), [dev.sh](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/dev.sh), [package scripts](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/web/package.json)
+```bash
+umask 077
+backup_dir="/opt/configs/artex/dev/backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$backup_dir"
+docker compose -p vps -f dev-docker-compose.yml exec -T postgres sh -lc \
+  'exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' > "$backup_dir/database.dump"
+tar -czf "$backup_dir/files.tgz" -C /opt/configs \
+  env/dev/artex.env env/dev/artex-postgres.env \
+  artex/dev/config.json artex/dev/jwt.key artex/dev/admin-password artex/dev/pg-password artex/dev/data
+```
 
-## 9. Troubleshooting
+一致性备份应先停止应用写入，完成后恢复应用。数据库恢复前停止应用，使用匹配的
+数据库与文件备份，恢复后重新验证登录和数据。不要覆盖 JWT 密钥或删除数据库卷来排查故障。
 
-- **Go version rejected:** follow `go.mod`'s 1.26.3 requirement, not only an older script's broader version message
-- **Dependency unavailable:** retain the package name, exact version, and redacted error; do not disable checksums or use unknown substitutes
-- **Database connection failure:** check actual port, role, database, the logged configuration path, and whether `ARTEX_PG_DSN` overrides the file
-- **Database creation/migration permission failure:** have the database administrator precreate the dedicated database and verify the application's object permissions; do not switch to a superuser
-- **API works but UI/assets are missing:** verify `web/out/index.html`, `server/webui/dist/index.html`, and the `embedui` build tag
-- **Port already in use:** choose an unused loopback port and update the check URLs; do not kill an unidentified process
-- **start.sh cannot find ./artex:** this guide builds the binary in the checkout root; `build.sh` defaults to a different output location under `dist`
-- **Old tasks, an existing admin password, enabled MCPs, or model profiles appear:** stop the check and verify database/data selection; do not interact with those tasks
-- **Restart loop:** `start.sh` retries abnormal exits with backoff; stop with Ctrl-C and inspect the first failure
-- **Readiness differs from health:** a 200 response from `/api/health` does not validate the database, frontend, model configuration, or the whole application
+数据库卷是 external，Compose down 不会删除它；`docker volume rm artex-local-pgdata`
+才会显式销毁数据库数据。文件备份不要包含 backups 自身，以免递归打包。
 
-## 10. Shutdown, retention, and cleanup
+## 6. 已知验证边界
 
-For a foreground run, press Ctrl-C. The supervisor forwards a termination signal to the child; the backend attempts graceful shutdown. Verify the process has exited, the application/proxy listeners have stopped, and the local health endpoint no longer responds.
+模型环境变量已加载，但容器健康检查和登录成功不能证明 Agent 的本机隐私安全，
+也不能代替 OneAPI 推理或授权靶场端到端验收。运行任务会把相关内容发送给模型服务。
+仍需避免接入个人浏览器、个人凭证目录、Docker socket 或不可信 MCP。
 
-Do not stop a shared PostgreSQL service or automatically delete the database, role, data directory, or backups.
-
-To retain an instance, preserve:
-
-- A PostgreSQL database backup
-- `config.json`
-- `data/`
-- The actual `skills/` directory
-- **`jwt.key` beside the executable**
-
-At this revision, JWT key storage is beside the executable, not solely inside `data/`. Backing up only `data/` is insufficient. In a container, mounting only `/app/data` likewise does not cover the current JWT key location.
-
-Sources: [supervisor](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/start.sh), [shutdown](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/cmd/artex/main.go), [JWT key location/migration](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/server/auth.go#L46-L92)
-
-## 11. Why the existing Docker path is not the verified route here
-
-The README states that the original Docker deployment source is no longer available, but Compose still references `autumn27/artex:latest`. The Dockerfile is not a self-contained source-build image: it expects a prebuilt Linux binary at `dist/${TARGETARCH}/artex`.
-
-Other unresolved points:
-
-- The Dockerfile executes a remote installation script and downloads `latest` tool packages/browser artifacts; it is not fully pinned
-- It does not declare a non-root `USER`
-- Compose's HTTP port mapping for 8787 is not restricted to loopback
-- Building/running Docker requires appropriate Docker access, potentially involving a privileged daemon
-- Image availability/provenance, digests, dependency downloads, and architecture matching have not been tested
-- The current JWT key location and documented volume persistence need reconciliation
-
-Do not treat the original Compose command, automatic installer, or an unknown replacement image as a validated local deployment procedure.
-
-Sources: [README](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/README.md), [Dockerfile](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/Dockerfile), [Compose](https://github.com/Laisky/ARTEX/blob/5c0dbd4bec940f3c0faf20705a56d879b57d3dfe/docker-compose.yml)
-
-## Acceptance checklist
-
-- [ ] Record pinned source revision, OS, and actual toolchain versions
-- [ ] Build successfully using trusted dependency sources
-- [ ] Start using a genuinely new local database and independent data directory
-- [ ] Verify HTTP/proxy listeners are loopback-only
-- [ ] Confirm no model credentials, targets, or enabled MCPs
-- [ ] Verify health, auth status, and UI without creating tasks
-- [ ] Verify Ctrl-C stops the application and proxy
-- [ ] Attach only redacted observations and identify tested platforms
-- [ ] Keep all unverified steps explicitly labeled until tested
+迁移与验证回执保存在 `/opt/configs/artex/dev/backups/`。此前保存在用户目录下的
+ARTEX 私有密码和迁移备份一并迁入该目录树，源码仓库不再保留真实运行凭据或工作数据。
